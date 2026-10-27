@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/proxy"
 
 	"github.com/netbirdio/netbird/client/embed"
+	"github.com/netbirdio/netbird/shared/management/http/api"
 )
 
 const (
@@ -40,6 +41,7 @@ const (
 	SecWebsocketVersionHeader    = "Sec-Websocket-Version"
 	SecWebsocketProtocolHeader   = "Sec-Websocket-Protocol"
 	SecWebsocketExtensionsHeader = "Sec-Websocket-Extensions"
+	StreamProtocolVersionHeader  = "X-Stream-Protocol-Version"
 
 	KubectlCommandHeader    = "Kubectl-Command"
 	KubectlSessionHeader    = "Kubectl-Session"
@@ -48,6 +50,8 @@ const (
 	KubectlBuildHeader      = "Kubectl-Build"
 	ImpersonateUserHeader   = "Impersonate-User"
 	ImpersonateGroupHeader  = "Impersonate-Group"
+
+	PeerUserPrefix = "netbird:peer:"
 )
 
 func Server(embedClient *embed.Client, peerStore *PeerStore, kubeAPIServerURL *url.URL) (*http.Server, error) {
@@ -117,7 +121,17 @@ func proxyHandler(peerStore *PeerStore, kubeAPIServerURL *url.URL, certPool *x50
 		MinVersion: tls.VersionTLS12,
 	}
 
-	upgradeHandler := proxy.NewUpgradeAwareHandler(kubeAPIServerURL, transport, true, false, &ErrorResponder{})
+	// UpgradeAwareHandler 301-redirects any GET or HEAD request to its
+	// trailing-slash form when Location.Path is empty, as a workaround for
+	// https://issue.k8s.io/4958. This breaks exact-path API endpoints such
+	// as /openapi/v2, whose trailing-slash variants the API server does not
+	// serve. Ensure the location always has a non-empty path.
+	location := *kubeAPIServerURL
+	if location.Path == "" {
+		location.Path = "/"
+	}
+
+	upgradeHandler := proxy.NewUpgradeAwareHandler(&location, transport, true, false, &ErrorResponder{})
 	upgradeHandler.UseRequestLocation = true
 
 	return func(rw http.ResponseWriter, req *http.Request) {
@@ -148,6 +162,7 @@ func proxyHandler(peerStore *PeerStore, kubeAPIServerURL *url.URL, certPool *x50
 			SecWebsocketVersionHeader:    nil,
 			SecWebsocketProtocolHeader:   nil,
 			SecWebsocketExtensionsHeader: nil,
+			StreamProtocolVersionHeader:  nil,
 		}
 		for k, v := range req.Header {
 			if _, ok := allowedHeaders[k]; !ok {
@@ -172,7 +187,7 @@ func proxyHandler(peerStore *PeerStore, kubeAPIServerURL *url.URL, certPool *x50
 			rw.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		req.Header.Set(ImpersonateUserHeader, peer.UserId)
+		req.Header.Set(ImpersonateUserHeader, impersonateUser(peer))
 		for _, group := range peer.Groups {
 			req.Header.Add(ImpersonateGroupHeader, group.Name)
 		}
@@ -180,6 +195,13 @@ func proxyHandler(peerStore *PeerStore, kubeAPIServerURL *url.URL, certPool *x50
 
 		upgradeHandler.ServeHTTP(rw, req)
 	}
+}
+
+func impersonateUser(peer api.Peer) string {
+	if peer.UserId != "" {
+		return peer.UserId
+	}
+	return PeerUserPrefix + peer.Id
 }
 
 func getBearerToken() (string, error) {
